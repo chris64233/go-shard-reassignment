@@ -204,6 +204,12 @@ func (m *Manager) SubmitReceipt(r Receipt) error {
 	if r.Checkpoint > task.TargetWatermark {
 		task.TargetWatermark = r.Checkpoint
 	}
+	if r.Digest != "" {
+		if task.Digests == nil {
+			task.Digests = map[uint64]string{}
+		}
+		task.Digests[r.Checkpoint] = r.Digest
+	}
 	task.UpdatedAt = m.now()
 	m.auditLocked(task, EventReceiptAccepted,
 		fmt.Sprintf("checkpoint %d confirmed by %s", r.Checkpoint, r.NodeID))
@@ -294,6 +300,174 @@ func (m *Manager) AbortCutover(migrationID, leaseToken, reason string) error {
 	return m.store.Save(m.state)
 }
 
+// RequestReplan 在迁移途中申请重新规划目标节点。只有迁移尚未切换正式
+// 归属（复制中或追平待切换）且原目标明确不可继续（已下线）时才能申请。
+// 申请会冻结原迁移版本、已确认检查点及摘要、原目标、候选新目标与失败
+// 原因。相同重新规划号和内容返回原结果；检查点、候选目标或迁移版本
+// 变化返回 ErrConflict。
+func (m *Manager) RequestReplan(req ReplanRequest) (*Replan, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if req.RequestID == "" || req.MigrationID == "" || req.Reason == "" || len(req.Candidates) == 0 {
+		return nil, fmt.Errorf("%w: request_id/migration/reason/candidates are required", ErrInvalidRequest)
+	}
+	task, ok := m.state.Tasks[req.MigrationID]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, req.MigrationID)
+	}
+	for _, c := range req.Candidates {
+		if c == "" || c == task.Source {
+			return nil, fmt.Errorf("%w: invalid candidate %q", ErrInvalidRequest, c)
+		}
+	}
+	if id, ok := m.state.ReplanRequests[req.RequestID]; ok {
+		existing := m.state.Replans[id]
+		if !existing.sameParams(req, task) {
+			return nil, fmt.Errorf("%w: replan %s reused with different parameters", ErrConflict, req.RequestID)
+		}
+		dup := *existing
+		return &dup, nil
+	}
+	if task.Phase != PhaseCopying && task.Phase != PhaseCaughtUp {
+		return nil, fmt.Errorf("%w: %s is %s, ownership already switching or closed",
+			ErrInvalidPhase, task.ID, task.Phase)
+	}
+	if m.nodeUp(task.Target) {
+		return nil, fmt.Errorf("%w: target %s is still available, replan not allowed",
+			ErrInvalidPhase, task.Target)
+	}
+	for _, r := range m.state.Replans {
+		if r.MigrationID == task.ID && r.NewMigrationID == "" {
+			return nil, fmt.Errorf("%w: migration %s already has open replan %s",
+				ErrConflict, task.ID, r.ID)
+		}
+	}
+	frozenDigests := map[uint64]string{}
+	for cp, d := range task.Digests {
+		frozenDigests[cp] = d
+	}
+	replan := &Replan{
+		ID:              "replan-" + req.RequestID,
+		RequestID:       req.RequestID,
+		MigrationID:     task.ID,
+		ShardID:         task.ShardID,
+		FrozenVersion:   task.Version,
+		FrozenWatermark: task.CopyWatermark,
+		FrozenDigests:   frozenDigests,
+		OriginalTarget:  task.Target,
+		Candidates:      append([]string(nil), req.Candidates...),
+		Reason:          req.Reason,
+		CreatedAt:       m.now(),
+	}
+	m.state.Replans[replan.ID] = replan
+	m.state.ReplanRequests[req.RequestID] = replan.ID
+	m.auditLocked(task, EventReplanRequested,
+		fmt.Sprintf("replan %s frozen version=%d watermark=%d target=%s candidates=%v reason=%q",
+			replan.ID, task.Version, task.CopyWatermark, task.Target, req.Candidates, req.Reason))
+	if err := m.store.Save(m.state); err != nil {
+		return nil, err
+	}
+	dup := *replan
+	return &dup, nil
+}
+
+// ConfirmReplan 确认重新规划并生成新的迁移版本。新目标必须来自冻结的
+// 候选集合且在线；可复用进度由可验证的检查点和摘要决定：仅当新目标
+// 提交的 ReuseProof 与冻结的已确认检查点摘要一致时才复用到该检查点，
+// 否则从安全位置（冻结范围起点）重新复制，绝不直接采信原目标上报的
+// 最高数字。旧迁移在同一持久化事务内被取代（SUPERSEDED），源归属保持
+// 不变，旧目标停止领取；旧目标迟到的复制或切换回执只能进入历史。
+// 相同确认重复提交返回原结果，内容变化返回 ErrConflict。
+func (m *Manager) ConfirmReplan(replanID, newTarget string, proof ReuseProof) (*Task, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	replan, ok := m.state.Replans[replanID]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, replanID)
+	}
+	if replan.NewMigrationID != "" {
+		created := m.state.Tasks[replan.NewMigrationID]
+		if created.Target != newTarget || created.Reuse == nil ||
+			created.Reuse.Proof != proof {
+			return nil, fmt.Errorf("%w: replan %s already confirmed with different parameters",
+				ErrConflict, replanID)
+		}
+		dup := *created
+		return &dup, nil
+	}
+	task := m.state.Tasks[replan.MigrationID]
+	if task.Phase == PhaseCompleted {
+		return nil, fmt.Errorf("%w: %s already completed, replan closed", ErrConflict, task.ID)
+	}
+	if task.Phase != PhaseCopying && task.Phase != PhaseCaughtUp {
+		return nil, fmt.Errorf("%w: %s is %s", ErrInvalidPhase, task.ID, task.Phase)
+	}
+	candidate := false
+	for _, c := range replan.Candidates {
+		if c == newTarget {
+			candidate = true
+			break
+		}
+	}
+	if !candidate {
+		return nil, fmt.Errorf("%w: %s is not a frozen candidate", ErrConflict, newTarget)
+	}
+	if !m.nodeUp(newTarget) {
+		return nil, fmt.Errorf("%w: %s is down", ErrNodeUnavailable, newTarget)
+	}
+	// 进度复用判定：仅采信与冻结摘要一致的已确认检查点。
+	reusedFrom := task.FromCheckpoint
+	verified := false
+	if proof.Checkpoint > task.FromCheckpoint && proof.Checkpoint <= replan.FrozenWatermark &&
+		proof.Checkpoint <= task.ToCheckpoint && proof.Digest != "" &&
+		replan.FrozenDigests[proof.Checkpoint] == proof.Digest {
+		reusedFrom = proof.Checkpoint
+		verified = true
+	}
+	now := m.now()
+	task.Phase = PhaseSuperseded
+	task.LeaseToken = ""
+	task.UpdatedAt = now
+	m.auditLocked(task, EventMigrationSuperseded,
+		fmt.Sprintf("superseded by replan %s; confirmed progress up to %d preserved",
+			replan.ID, task.CopyWatermark))
+	newTask := &Task{
+		ID:              "mig-" + replan.RequestID,
+		RequestID:       replan.RequestID,
+		ShardID:         task.ShardID,
+		Source:          task.Source,
+		Target:          newTarget,
+		Version:         task.Version + 1,
+		FromCheckpoint:  reusedFrom,
+		ToCheckpoint:    task.ToCheckpoint,
+		Phase:           PhaseCopying,
+		CopyWatermark:   reusedFrom,
+		TargetWatermark: reusedFrom,
+		ReplanOf:        task.ID,
+		ReplanRequestID: replan.RequestID,
+		Reuse: &ReuseBasis{
+			Proof:      proof,
+			Verified:   verified,
+			ReusedFrom: reusedFrom,
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if reusedFrom >= newTask.ToCheckpoint {
+		newTask.Phase = PhaseCaughtUp
+	}
+	m.state.Tasks[newTask.ID] = newTask
+	replan.NewMigrationID = newTask.ID
+	m.auditLocked(newTask, EventReplanConfirmed,
+		fmt.Sprintf("replan %s confirmed: version=%d target=%s reused_from=%d verified=%t",
+			replan.ID, newTask.Version, newTarget, reusedFrom, verified))
+	if err := m.store.Save(m.state); err != nil {
+		return nil, err
+	}
+	dup := *newTask
+	return &dup, nil
+}
+
 // FailMigration 将迁移标记为失败。正式归属从未改变（保持源节点），
 // 已确认的复制进度与失败原因保留可查。重复失败调用幂等。
 func (m *Manager) FailMigration(migrationID, reason string) error {
@@ -351,6 +525,21 @@ func (m *Manager) statusLocked(shardID string) (Status, bool) {
 		st.LeaseToken = latest.LeaseToken
 		st.Attempts = latest.Attempts
 		st.FailureReason = latest.FailureReason
+		st.PreviousMigrationID = latest.ReplanOf
+		if latest.Reuse != nil {
+			reuse := *latest.Reuse
+			st.Reuse = &reuse
+		}
+		// 最终目标：迁移链上最新一条未被取代的迁移的目标。
+		head := latest
+		for head.Phase == PhaseSuperseded {
+			next, ok := m.successorLocked(head.ID)
+			if !ok {
+				break
+			}
+			head = next
+		}
+		st.FinalTarget = head.Target
 	}
 	for _, e := range m.state.Audit {
 		if e.ShardID == shardID {
@@ -358,6 +547,16 @@ func (m *Manager) statusLocked(shardID string) (Status, bool) {
 		}
 	}
 	return st, known || latest != nil
+}
+
+// successorLocked 返回取代给定迁移的新版本迁移（若存在）。
+func (m *Manager) successorLocked(migrationID string) (*Task, bool) {
+	for _, t := range m.state.Tasks {
+		if t.ReplanOf == migrationID {
+			return t, true
+		}
+	}
+	return nil, false
 }
 
 // Migration 按 ID 返回迁移任务视图。

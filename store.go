@@ -14,17 +14,21 @@ import (
 // 保证归属改写与任务阶段推进属于同一个持久化事务，崩溃后不会出现
 // “归属已改但任务未完成”之类的中间态。
 type persistedState struct {
-	Tasks    map[string]*Task  `json:"tasks"`
-	Owners   map[string]string `json:"owners"`
-	Requests map[string]string `json:"requests"`
-	Audit    []AuditEntry      `json:"audit"`
+	Tasks          map[string]*Task   `json:"tasks"`
+	Owners         map[string]string  `json:"owners"`
+	Requests       map[string]string  `json:"requests"`
+	Replans        map[string]*Replan `json:"replans"`
+	ReplanRequests map[string]string  `json:"replan_requests"`
+	Audit          []AuditEntry       `json:"audit"`
 }
 
 func newPersistedState() *persistedState {
 	return &persistedState{
-		Tasks:    map[string]*Task{},
-		Owners:   map[string]string{},
-		Requests: map[string]string{},
+		Tasks:          map[string]*Task{},
+		Owners:         map[string]string{},
+		Requests:       map[string]string{},
+		Replans:        map[string]*Replan{},
+		ReplanRequests: map[string]string{},
 	}
 }
 
@@ -115,6 +119,16 @@ func cloneState(s *persistedState) *persistedState {
 	out := newPersistedState()
 	for k, v := range s.Tasks {
 		task := *v
+		if v.Digests != nil {
+			task.Digests = map[uint64]string{}
+			for cp, d := range v.Digests {
+				task.Digests[cp] = d
+			}
+		}
+		if v.Reuse != nil {
+			reuse := *v.Reuse
+			task.Reuse = &reuse
+		}
 		out.Tasks[k] = &task
 	}
 	for k, v := range s.Owners {
@@ -122,6 +136,20 @@ func cloneState(s *persistedState) *persistedState {
 	}
 	for k, v := range s.Requests {
 		out.Requests[k] = v
+	}
+	for k, v := range s.Replans {
+		replan := *v
+		if v.FrozenDigests != nil {
+			replan.FrozenDigests = map[uint64]string{}
+			for cp, d := range v.FrozenDigests {
+				replan.FrozenDigests[cp] = d
+			}
+		}
+		replan.Candidates = append([]string(nil), v.Candidates...)
+		out.Replans[k] = &replan
+	}
+	for k, v := range s.ReplanRequests {
+		out.ReplanRequests[k] = v
 	}
 	out.Audit = append(out.Audit, s.Audit...)
 	return out
