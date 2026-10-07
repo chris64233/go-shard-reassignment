@@ -17,11 +17,13 @@ const (
 	PhaseCompleted Phase = "COMPLETED"
 	// PhaseFailed 已失败：回滚到原归属，失败原因与已确认进度保留可查。
 	PhaseFailed Phase = "FAILED"
+	// PhaseSuperseded 已被重新规划取代：旧目标停止领取，迟到回执只进历史。
+	PhaseSuperseded Phase = "SUPERSEDED"
 )
 
 // Terminal 报告阶段是否为终态（不再接受任何推进）。
 func (p Phase) Terminal() bool {
-	return p == PhaseCompleted || p == PhaseFailed
+	return p == PhaseCompleted || p == PhaseFailed || p == PhaseSuperseded
 }
 
 // StartRequest 是发起迁移的请求。RequestID 用于幂等去重：
@@ -45,6 +47,54 @@ type Receipt struct {
 	Checkpoint  uint64
 }
 
+// ReplanRequest 是迁移途中重新规划目标节点的请求。RequestID 为幂等键：
+// 相同重新规划号且内容一致返回原结果；检查点、候选目标或迁移版本变化
+// 返回 ErrConflict。ReuseCheckpoint 与 Digest 共同构成进度复用依据：
+// 只有不超过原迁移已确认水位、且摘要可被新目标证明一致的部分才能复用。
+type ReplanRequest struct {
+	RequestID       string
+	MigrationID     string
+	NewTarget       string
+	Reason          string
+	ReuseCheckpoint uint64
+	Digest          string
+}
+
+// 重新规划记录的状态。
+const (
+	ReplanPending   = "PENDING"
+	ReplanConfirmed = "CONFIRMED"
+	ReplanAborted   = "ABORTED"
+)
+
+// Replan 是一次重新规划的持久化记录，申请时冻结原迁移版本、已确认
+// 检查点、原目标、候选新目标与失败原因。
+type Replan struct {
+	RequestID       string    `json:"request_id"`
+	MigrationID     string    `json:"migration_id"`
+	ShardID         string    `json:"shard_id"`
+	Version         uint64    `json:"version"`
+	OldTarget       string    `json:"old_target"`
+	NewTarget       string    `json:"new_target"`
+	Checkpoint      uint64    `json:"checkpoint"`
+	ReuseCheckpoint uint64    `json:"reuse_checkpoint"`
+	Digest          string    `json:"digest"`
+	Reason          string    `json:"reason"`
+	State           string    `json:"state"`
+	NewMigrationID  string    `json:"new_migration_id,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
+// sameContent 判断重新规划记录与请求内容是否一致（幂等/冲突判定）。
+func (r *Replan) sameContent(req ReplanRequest, task *Task) bool {
+	return r.MigrationID == req.MigrationID &&
+		r.Version == task.Version &&
+		r.NewTarget == req.NewTarget &&
+		r.Reason == req.Reason &&
+		r.ReuseCheckpoint == req.ReuseCheckpoint &&
+		r.Digest == req.Digest
+}
+
 // Task 是一次迁移任务的持久化记录，每次变更整体落盘。
 type Task struct {
 	ID              string    `json:"id"`
@@ -61,6 +111,11 @@ type Task struct {
 	LeaseToken      string    `json:"lease_token,omitempty"`
 	Attempts        int       `json:"attempts"`
 	FailureReason   string    `json:"failure_reason,omitempty"`
+	ReplanOf        string    `json:"replan_of,omitempty"`
+	ReplannedBy     string    `json:"replanned_by,omitempty"`
+	ReuseCheckpoint uint64    `json:"reuse_checkpoint,omitempty"`
+	ReuseDigest     string    `json:"reuse_digest,omitempty"`
+	PendingReplan   *Replan   `json:"pending_replan,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }
@@ -86,18 +141,24 @@ type AuditEntry struct {
 
 // 审计事件名。
 const (
-	EventMigrationStarted  = "migration_started"
-	EventReceiptAccepted   = "receipt_accepted"
-	EventReceiptRejected   = "receipt_rejected"
-	EventCaughtUp          = "caught_up"
-	EventCutoverStarted    = "cutover_started"
-	EventCutoverConfirmed  = "cutover_confirmed"
-	EventCutoverAborted    = "cutover_aborted"
-	EventMigrationFailed   = "migration_failed"
-	EventNodeDown          = "node_down"
-	EventNodeUp            = "node_up"
-	EventRecovered         = "recovered_after_restart"
-	EventOwnershipAssigned = "ownership_assigned"
+	EventMigrationStarted    = "migration_started"
+	EventReceiptAccepted     = "receipt_accepted"
+	EventReceiptRejected     = "receipt_rejected"
+	EventCaughtUp            = "caught_up"
+	EventCutoverStarted      = "cutover_started"
+	EventCutoverConfirmed    = "cutover_confirmed"
+	EventCutoverAborted      = "cutover_aborted"
+	EventMigrationFailed     = "migration_failed"
+	EventNodeDown            = "node_down"
+	EventNodeUp              = "node_up"
+	EventRecovered           = "recovered_after_restart"
+	EventOwnershipAssigned   = "ownership_assigned"
+	EventReplanRequested     = "replan_requested"
+	EventReplanConfirmed     = "replan_confirmed"
+	EventReplanAborted       = "replan_aborted"
+	EventMigrationSuperseded = "migration_superseded"
+	EventLateReceipt         = "late_receipt_recorded"
+	EventLateConfirm         = "late_cutover_confirm_recorded"
 )
 
 // Status 是分片迁移状态的查询视图。
@@ -117,5 +178,10 @@ type Status struct {
 	LeaseToken      string
 	Attempts        int
 	FailureReason   string
+	ReplanOf        string
+	ReplannedBy     string
+	ReuseCheckpoint uint64
+	ReuseDigest     string
+	PendingReplan   *Replan
 	Audit           []AuditEntry
 }

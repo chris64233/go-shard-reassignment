@@ -23,4 +23,10 @@ var (
 	ErrMigrationClosed = errors.New("migration already closed")
 	// ErrInvalidRequest 表示请求参数非法。
 	ErrInvalidRequest = errors.New("invalid migration request")
+	// ErrTargetViable 表示原目标仍可继续，不满足重新规划的前提。
+	ErrTargetViable = errors.New("replan requires target to be clearly unable to continue")
+	// ErrDigestMismatch 表示新目标无法证明复用区间数据一致。
+	ErrDigestMismatch = errors.New("reuse digest mismatch")
+	// ErrNoPendingReplan 表示迁移上没有待确认的重新规划。
+	ErrNoPendingReplan = errors.New("no pending replan")
 )

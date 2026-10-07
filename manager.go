@@ -177,6 +177,10 @@ func (m *Manager) SubmitReceipt(r Receipt) error {
 		return fmt.Errorf("%w: got %d, frozen %d", ErrStaleVersion, r.Version, task.Version)
 	}
 	if task.Phase.Terminal() {
+		m.auditLocked(task, EventLateReceipt,
+			fmt.Sprintf("late receipt checkpoint %d from %s on %s migration recorded to history",
+				r.Checkpoint, r.NodeID, task.Phase))
+		_ = m.store.Save(m.state)
 		return fmt.Errorf("%w: %s is %s", ErrMigrationClosed, task.ID, task.Phase)
 	}
 	if task.Phase == PhaseCuttingOver {
@@ -259,6 +263,12 @@ func (m *Manager) ConfirmCutover(migrationID, leaseToken string) error {
 	if task.Phase == PhaseCompleted && task.LeaseToken == leaseToken {
 		return nil // 幂等确认：归属已改写，不重复切换
 	}
+	if task.Phase.Terminal() {
+		m.auditLocked(task, EventLateConfirm,
+			fmt.Sprintf("late cutover confirm on %s migration recorded to history", task.Phase))
+		_ = m.store.Save(m.state)
+		return fmt.Errorf("%w: %s is %s", ErrMigrationClosed, task.ID, task.Phase)
+	}
 	if task.Phase != PhaseCuttingOver {
 		return fmt.Errorf("%w: %s is %s", ErrInvalidPhase, migrationID, task.Phase)
 	}
@@ -317,6 +327,185 @@ func (m *Manager) FailMigration(migrationID, reason string) error {
 	return m.store.Save(m.state)
 }
 
+// RequestReplan 在迁移途中申请重新规划目标节点。前提：迁移尚未切换正式
+// 归属（处于复制中或追平待切换）且原目标明确不可继续（已失联）。申请会
+// 冻结原迁移版本、已确认检查点、原目标、候选新目标与失败原因。
+// 复用进度必须满足：ReuseCheckpoint 不超过已确认水位（绝不采用原目标
+// 上报的最高数字），并携带可验证摘要 Digest。相同 RequestID 且内容一致
+// 返回原记录；检查点、候选目标或迁移版本变化返回 ErrConflict。
+func (m *Manager) RequestReplan(req ReplanRequest) (*Replan, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if req.RequestID == "" || req.MigrationID == "" || req.NewTarget == "" ||
+		req.Reason == "" || req.Digest == "" {
+		return nil, fmt.Errorf("%w: request_id/migration/new_target/reason/digest are required", ErrInvalidRequest)
+	}
+	task, ok := m.state.Tasks[req.MigrationID]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, req.MigrationID)
+	}
+	if existing, ok := m.state.Replans[req.RequestID]; ok {
+		if !existing.sameContent(req, task) {
+			return nil, fmt.Errorf("%w: replan %s reused with different checkpoint/candidate/version", ErrConflict, req.RequestID)
+		}
+		dup := *existing
+		return &dup, nil
+	}
+	if task.Phase.Terminal() {
+		return nil, fmt.Errorf("%w: %s is %s", ErrMigrationClosed, task.ID, task.Phase)
+	}
+	if task.Phase != PhaseCopying && task.Phase != PhaseCaughtUp {
+		return nil, fmt.Errorf("%w: %s is %s", ErrInvalidPhase, task.ID, task.Phase)
+	}
+	if m.nodeUp(task.Target) {
+		return nil, fmt.Errorf("%w: target %s is still reachable", ErrTargetViable, task.Target)
+	}
+	if task.PendingReplan != nil {
+		return nil, fmt.Errorf("%w: %s already has pending replan %s", ErrConflict, task.ID, task.PendingReplan.RequestID)
+	}
+	if req.NewTarget == task.Source || req.NewTarget == task.Target {
+		return nil, fmt.Errorf("%w: new target must differ from source and old target", ErrInvalidRequest)
+	}
+	if req.ReuseCheckpoint < task.FromCheckpoint || req.ReuseCheckpoint > task.CopyWatermark {
+		return nil, fmt.Errorf("%w: reuse checkpoint %d outside confirmed range [%d,%d]",
+			ErrOutOfRange, req.ReuseCheckpoint, task.FromCheckpoint, task.CopyWatermark)
+	}
+	replan := &Replan{
+		RequestID:       req.RequestID,
+		MigrationID:     task.ID,
+		ShardID:         task.ShardID,
+		Version:         task.Version,
+		OldTarget:       task.Target,
+		NewTarget:       req.NewTarget,
+		Checkpoint:      task.CopyWatermark,
+		ReuseCheckpoint: req.ReuseCheckpoint,
+		Digest:          req.Digest,
+		Reason:          req.Reason,
+		State:           ReplanPending,
+		CreatedAt:       m.now(),
+	}
+	task.PendingReplan = replan
+	task.UpdatedAt = m.now()
+	m.state.Replans[replan.RequestID] = replan
+	m.auditLocked(task, EventReplanRequested,
+		fmt.Sprintf("frozen version=%d checkpoint=%d old_target=%s new_target=%s reuse=%d reason=%s",
+			replan.Version, replan.Checkpoint, replan.OldTarget, replan.NewTarget,
+			replan.ReuseCheckpoint, replan.Reason))
+	if err := m.store.Save(m.state); err != nil {
+		return nil, err
+	}
+	dup := *replan
+	return &dup, nil
+}
+
+// ConfirmReplan 确认重新规划：校验新目标对复用区间的摘要证明，生成新的
+// 迁移版本（源归属与正式归属均不变），旧迁移进入 SUPERSEDED 终态，旧目标
+// 停止领取。摘要不一致时拒绝，调用方需以更低（可证明一致）的检查点重新
+// 申请，无法证明一致的部分将从安全位置重新复制。
+func (m *Manager) ConfirmReplan(migrationID, proofDigest string) (*Task, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	task, ok := m.state.Tasks[migrationID]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, migrationID)
+	}
+	replan := task.PendingReplan
+	if replan == nil {
+		return nil, fmt.Errorf("%w: %s", ErrNoPendingReplan, migrationID)
+	}
+	if task.Phase.Terminal() {
+		return nil, fmt.Errorf("%w: %s is %s", ErrMigrationClosed, task.ID, task.Phase)
+	}
+	if task.Phase != PhaseCopying && task.Phase != PhaseCaughtUp {
+		// 切换已先行签发：切换主线获胜，重新规划失效。
+		return nil, fmt.Errorf("%w: %s is %s, cutover won the race", ErrInvalidPhase, task.ID, task.Phase)
+	}
+	if proofDigest != replan.Digest {
+		m.auditLocked(task, EventReceiptRejected,
+			fmt.Sprintf("replan proof digest mismatch for reuse checkpoint %d", replan.ReuseCheckpoint))
+		_ = m.store.Save(m.state)
+		return nil, fmt.Errorf("%w: reuse up to %d not proven", ErrDigestMismatch, replan.ReuseCheckpoint)
+	}
+	now := m.now()
+	newTask := &Task{
+		ID:              "mig-" + replan.RequestID,
+		RequestID:       replan.RequestID,
+		ShardID:         task.ShardID,
+		Source:          task.Source,
+		Target:          replan.NewTarget,
+		Version:         task.Version + 1,
+		FromCheckpoint:  replan.ReuseCheckpoint,
+		ToCheckpoint:    task.ToCheckpoint,
+		Phase:           PhaseCopying,
+		CopyWatermark:   replan.ReuseCheckpoint,
+		TargetWatermark: replan.ReuseCheckpoint,
+		ReplanOf:        task.ID,
+		ReuseCheckpoint: replan.ReuseCheckpoint,
+		ReuseDigest:     replan.Digest,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	if newTask.CopyWatermark >= newTask.ToCheckpoint {
+		newTask.Phase = PhaseCaughtUp
+	}
+	task.Phase = PhaseSuperseded
+	task.LeaseToken = ""
+	task.PendingReplan = nil
+	task.ReplannedBy = newTask.ID
+	task.UpdatedAt = now
+	replan.State = ReplanConfirmed
+	replan.NewMigrationID = newTask.ID
+	m.state.Tasks[newTask.ID] = newTask
+	m.state.Requests[replan.RequestID] = newTask.ID
+	m.auditLocked(task, EventMigrationSuperseded,
+		fmt.Sprintf("superseded by %s (version %d), old target %s stops claiming",
+			newTask.ID, newTask.Version, task.Target))
+	m.auditLocked(newTask, EventReplanConfirmed,
+		fmt.Sprintf("version %d target=%s reusing verified prefix [%d,%d] digest=%s; source ownership unchanged",
+			newTask.Version, newTask.Target, newTask.FromCheckpoint, replan.ReuseCheckpoint, replan.Digest))
+	if err := m.store.Save(m.state); err != nil {
+		return nil, err
+	}
+	dup := *newTask
+	return &dup, nil
+}
+
+// AbortReplan 放弃待确认的重新规划（例如新目标准备失败）：保留原迁移
+// 及已确认进度，不会留下两个都可切换的目标。
+func (m *Manager) AbortReplan(migrationID, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	task, ok := m.state.Tasks[migrationID]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrNotFound, migrationID)
+	}
+	replan := task.PendingReplan
+	if replan == nil {
+		return fmt.Errorf("%w: %s", ErrNoPendingReplan, migrationID)
+	}
+	if task.Phase.Terminal() {
+		return fmt.Errorf("%w: %s is %s", ErrMigrationClosed, task.ID, task.Phase)
+	}
+	task.PendingReplan = nil
+	task.UpdatedAt = m.now()
+	replan.State = ReplanAborted
+	m.auditLocked(task, EventReplanAborted,
+		fmt.Sprintf("replan %s aborted: %s; original migration and confirmed progress kept",
+			replan.RequestID, reason))
+	return m.store.Save(m.state)
+}
+
+// Replan 按重新规划号返回记录视图。
+func (m *Manager) Replan(requestID string) (Replan, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	replan, ok := m.state.Replans[requestID]
+	if !ok {
+		return Replan{}, false
+	}
+	return *replan, true
+}
+
 // Status 返回分片当前归属与最近一次迁移的完整视图（含审计历史）。
 func (m *Manager) Status(shardID string) (Status, bool) {
 	m.mu.Lock()
@@ -338,19 +527,7 @@ func (m *Manager) statusLocked(shardID string) (Status, bool) {
 		}
 	}
 	if latest != nil {
-		st.HasMigration = true
-		st.MigrationID = latest.ID
-		st.Phase = latest.Phase
-		st.Version = latest.Version
-		st.Source = latest.Source
-		st.Target = latest.Target
-		st.FromCheckpoint = latest.FromCheckpoint
-		st.ToCheckpoint = latest.ToCheckpoint
-		st.CopyWatermark = latest.CopyWatermark
-		st.TargetWatermark = latest.TargetWatermark
-		st.LeaseToken = latest.LeaseToken
-		st.Attempts = latest.Attempts
-		st.FailureReason = latest.FailureReason
+		m.fillTaskViewLocked(&st, latest)
 	}
 	for _, e := range m.state.Audit {
 		if e.ShardID == shardID {
@@ -360,7 +537,40 @@ func (m *Manager) statusLocked(shardID string) (Status, bool) {
 	return st, known || latest != nil
 }
 
-// Migration 按 ID 返回迁移任务视图。
+// fillTaskViewLocked 将任务及其版本关系、进度复用依据填入查询视图。
+func (m *Manager) fillTaskViewLocked(st *Status, task *Task) {
+	st.HasMigration = true
+	st.MigrationID = task.ID
+	st.Phase = task.Phase
+	st.Version = task.Version
+	st.Source = task.Source
+	st.Target = task.Target
+	st.FromCheckpoint = task.FromCheckpoint
+	st.ToCheckpoint = task.ToCheckpoint
+	st.CopyWatermark = task.CopyWatermark
+	st.TargetWatermark = task.TargetWatermark
+	st.LeaseToken = task.LeaseToken
+	st.Attempts = task.Attempts
+	st.FailureReason = task.FailureReason
+	st.ReplanOf = task.ReplanOf
+	st.ReuseCheckpoint = task.ReuseCheckpoint
+	st.ReuseDigest = task.ReuseDigest
+	if task.PendingReplan != nil {
+		replan := *task.PendingReplan
+		st.PendingReplan = &replan
+	}
+	st.ReplannedBy = task.ReplannedBy
+	if st.ReplannedBy == "" {
+		for _, other := range m.state.Tasks {
+			if other.ReplanOf == task.ID {
+				st.ReplannedBy = other.ID
+				break
+			}
+		}
+	}
+}
+
+// Migration 按 ID 返回该迁移任务的查询视图（含版本关系与复用依据）。
 func (m *Manager) Migration(migrationID string) (Status, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -368,7 +578,13 @@ func (m *Manager) Migration(migrationID string) (Status, bool) {
 	if !ok {
 		return Status{}, false
 	}
-	st, _ := m.statusLocked(task.ShardID)
+	st := Status{ShardID: task.ShardID, Owner: m.state.Owners[task.ShardID]}
+	m.fillTaskViewLocked(&st, task)
+	for _, e := range m.state.Audit {
+		if e.ShardID == task.ShardID {
+			st.Audit = append(st.Audit, e)
+		}
+	}
 	return st, true
 }
 
